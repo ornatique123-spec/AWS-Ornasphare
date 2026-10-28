@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Chain try-on</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { width: 100vw; height: 100vh; object-fit: cover; display: block; }
+  canvas.mirror { transform: scaleX(-1); }
+  video { display: none; }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<video id="cam" playsinline muted autoplay></video>
+<script>
+/* ===== Flutter bridge: message queue (bridge તૈયાર ના હોય ત્યાં સુધી રાખે) ===== */
+(function () {
+  var q = [], ready = false;
+  function send(name, args) {
+    try { window.flutter_inappwebview.callHandler.apply(null, [name].concat(args)); }
+    catch (e) { console.log("bridge send failed", e); }
+  }
+  window.toFlutter = function (name) {
+    var args = Array.prototype.slice.call(arguments, 1);
+    if (ready) send(name, args); else q.push([name, args]);
+  };
+  function flush() {
+    if (ready) return;
+    ready = true;
+    while (q.length) { var m = q.shift(); send(m[0], m[1]); }
+  }
+  window.addEventListener("flutterInAppWebViewPlatformReady", flush);
+  if (window.flutter_inappwebview && window.flutter_inappwebview.callHandler) flush();
+  /* safety: થોડી વાર પછી ફરી તપાસ */
+  var tries = 0, t = setInterval(function () {
+    tries++;
+    if (window.flutter_inappwebview && window.flutter_inappwebview.callHandler) { flush(); clearInterval(t); }
+    if (tries > 50) clearInterval(t);
+  }, 200);
+
+  /* કોઈ પણ JS ભૂલ સીધી Flutter માં */
+  window.addEventListener("error", function (e) {
+    toFlutter("jsError", String((e && e.message) || e));
+  });
+  window.addEventListener("unhandledrejection", function (e) {
+    var r = e && e.reason;
+    toFlutter("jsError", String((r && (r.message || r.name)) || r));
+  });
+
+  toFlutter("status", "Page loaded…");
+})();
+</script>
+<script type="module">
+const VISION_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+const WASM_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+
+const video = document.getElementById("cam");
+const canvas = document.getElementById("view");
+const ctx = canvas.getContext("2d");
+
+/* 🔥 સીધો selfie camera */
+let landmarker = null, stream = null, facing = "user";
+let JEWEL = null;
+let sizeFactor = 1, offsetFactor = 0, showPoints = false;
+let lastTime = -1, smooth = null, lastStatus = null;
+
+function setStatus(text) {
+  if (text === lastStatus) return;
+  lastStatus = text;
+  toFlutter("status", text || "");
+}
+
+/* ---------- Flutter → JS functions ---------- */
+window.setRing = (cfg) => {
+  const img = new Image();
+  img.onload = () => {
+    JEWEL = { img, ax: cfg.anchorX ?? 0.5, ay: cfg.anchorY ?? 0.077, span: cfg.bandWidth ?? 0.75 };
+    console.log("jewel image loaded", img.naturalWidth, img.naturalHeight);
+  };
+  img.onerror = () => toFlutter("jsError", "Jewellery image could not be loaded");
+  img.src = cfg.src;
+};
+window.setSize = (v) => { sizeFactor = v; };
+window.setOffset = (v) => { offsetFactor = v; };
+window.setShowPoints = (v) => { showPoints = !!v; };
+window.flipCamera = async () => {
+  facing = facing === "user" ? "environment" : "user";
+  try { await startCamera(); } catch (e) { setStatus("This device has only one camera"); }
+};
+window.takePhoto = () => {
+  if (!canvas.width) return;
+  const out = document.createElement("canvas");
+  out.width = canvas.width; out.height = canvas.height;
+  const o = out.getContext("2d");
+  if (facing === "user") { o.translate(out.width, 0); o.scale(-1, 1); }
+  o.drawImage(canvas, 0, 0);
+  toFlutter("photo", out.toDataURL("image/png"));
+};
+
+/* functions તૈયાર → Flutter ને કહો (પછી Flutter image મોકલશે) */
+toFlutter("ready");
+
+/* ---------- camera ---------- */
+async function startCamera() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    throw new Error("Camera API not available in this WebView");
+  }
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: facing, width: { ideal: 960 }, height: { ideal: 1280 } },
+    audio: false,
+  });
+  video.srcObject = stream;
+  await video.play();
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  canvas.classList.toggle("mirror", facing === "user");
+  smooth = null;
+}
+
+const lerp = (a, b, t) => a + (b - a) * t;
+function lerpAngle(a, b, t) {
+  let d = b - a;
+  while (d > Math.PI) d -= 2 * Math.PI;
+  while (d < -Math.PI) d += 2 * Math.PI;
+  return a + d * t;
+}
+
+function drawJewel(s, scaleBase) {
+  if (!JEWEL) return;
+  const iw = JEWEL.img.naturalWidth, ih = JEWEL.img.naturalHeight;
+  const k = (scaleBase * sizeFactor) / (JEWEL.span * iw);
+  ctx.save();
+  ctx.translate(s.x, s.y);
+  ctx.rotate(s.a);
+  ctx.drawImage(JEWEL.img, -JEWEL.ax * iw * k, -JEWEL.ay * ih * k, iw * k, ih * k);
+  ctx.restore();
+}
+
+function drawPoints(pts) {
+  ctx.save();
+  pts.forEach((p, i) => {
+    ctx.fillStyle = i === pts.length - 1 ? "#4ADE80" : "#F87171";
+    ctx.beginPath(); ctx.arc(p.x, p.y, 7, 0, Math.PI * 2); ctx.fill();
+  });
+  ctx.restore();
+}
+
+/* ---------- boot ---------- */
+async function boot() {
+  try {
+    setStatus("Starting camera…");
+    await startCamera();
+    requestAnimationFrame(loop);
+  } catch (e) {
+    toFlutter("jsError", "Camera: " + (e.name || "") + " " + (e.message || e));
+    return;
+  }
+
+  try {
+    setStatus("Loading face model…");
+    const { FilesetResolver, FaceLandmarker } = await import(VISION_URL);
+    const vision = await FilesetResolver.forVisionTasks(WASM_URL);
+    landmarker = await FaceLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath:
+          "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+        delegate: "GPU",
+      },
+      runningMode: "VIDEO",
+      numFaces: 1,
+    });
+    setStatus("Look at the camera");
+  } catch (e) {
+    toFlutter("jsError", "AI model could not load (check internet): " + (e.message || e));
+  }
+}
+
+function loop() {
+  if (!video.videoWidth) { requestAnimationFrame(loop); return; }
+  const W = canvas.width, H = canvas.height;
+  ctx.drawImage(video, 0, 0, W, H);
+
+  if (landmarker && video.currentTime !== lastTime) {
+    lastTime = video.currentTime;
+    const res = landmarker.detectForVideo(video, performance.now());
+    const lm = res.faceLandmarks && res.faceLandmarks[0];
+
+    if (lm) {
+      const P = i => ({ x: lm[i].x * W, y: lm[i].y * H });
+      const chin = P(152), forehead = P(10), left = P(234), right = P(454);
+      const eyeL = P(33), eyeR = P(263);
+
+      const faceW = Math.hypot(right.x - left.x, right.y - left.y);
+      const faceH = Math.hypot(chin.x - forehead.x, chin.y - forehead.y);
+      const angle = Math.atan2(eyeR.y - eyeL.y, eyeR.x - eyeL.x);
+      const down = { x: -Math.sin(angle), y: Math.cos(angle) };
+
+      /* Chain નું ઉપરનું center: દાઢીથી નીચે, ગળાના મૂળ પાસે */
+      const drop = faceH * (0.42 + offsetFactor * 0.35);
+      const pos = { x: chin.x + down.x * drop, y: chin.y + down.y * drop };
+
+      const t = { x: pos.x, y: pos.y, a: angle, w: faceW };
+      smooth = smooth
+        ? { x: lerp(smooth.x, t.x, .45), y: lerp(smooth.y, t.y, .45),
+            a: lerpAngle(smooth.a, t.a, .4), w: lerp(smooth.w, t.w, .35) }
+        : t;
+
+      drawJewel(smooth, smooth.w * 0.95);
+      if (showPoints) drawPoints([chin, forehead, left, right, eyeL, eyeR, pos]);
+      setStatus("");
+    } else {
+      smooth = null;
+      setStatus("Look at the camera");
+    }
+  } else if (smooth) {
+    drawJewel(smooth, smooth.w * 0.95);
+  }
+  requestAnimationFrame(loop);
+}
+
+boot();
+</script>
+</body>
+</html>
