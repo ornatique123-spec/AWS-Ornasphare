@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:intl/intl.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:pecifician_sysytem/Settings/BranchManagementScreen.dart' show BranchApi, Company;
 
 import '../../../Api_Constant/ApiConstants.dart';
@@ -34,8 +35,41 @@ class BranchAi {
   static final Set<int> selected = {}; // chip selection (empty = all branches)
   static Future<void>? _initF;
 
-  /// call once (Ask AI initState) — admin check + branch list
-  static Future<void> init() => _initF ??= _init();
+  /// Kya login mate check thayu (token) — login badlay to fari check
+  static String _initFor = '';
+
+  /// Ask AI initState — admin check + branch list.
+  /// Same login → ek j vaar · login badlay (logout → bijo user) → fari check
+  static Future<void> init() async {
+    final String who = await _who();
+    if (_initF != null && who == _initFor) return _initF!;
+    reset(); // 🔄 juna user nu (admin / staff) bhulo
+    _initFor = who;
+    return _initF = _init();
+  }
+
+  /// 🚪 Logout vakhte call karo (optional — login badlay to aapo-aap thay chhe)
+  static void reset() {
+    _initF = null;
+    _initFor = '';
+    branches = [];
+    mainId = null;
+    canUse = false;
+    selected.clear();
+    _cache.clear();
+  }
+
+  /// Atyar nu login (token) — app ma save karelu
+  static Future<String> _who() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      for (final k in const ['token', 'access_token', 'auth_token', 'api_token']) {
+        final t = prefs.getString(k);
+        if (t != null && t.isNotEmpty) return t;
+      }
+    } catch (_) {}
+    return '';
+  }
 
   static Future<void> _init() async {
     try {

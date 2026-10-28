@@ -59,6 +59,8 @@ class AiReportBuilder {
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.white,
+      // 📱 Tablet par aakhi pahoḷai nahi — vachche sundar (max 760)
+      constraints: const BoxConstraints(maxWidth: 760),
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(10))),
       builder: (_) => _ReportSheet(initialCustomer: customer, query: query),
     );
@@ -79,6 +81,7 @@ class _Line {
   double metalRate = 0, metalAmt = 0;
   double other = 0, amount = 0;
   String status = '';
+  String branch = ''; // 🏢 branch merge → kai branch nu
 
   /// same piece in approval and in return (barcode, else name + net weight)
   String get key => barcode.trim().isNotEmpty
@@ -292,6 +295,12 @@ class _ReportSheetState extends State<_ReportSheet> {
   List<String> _jobWorkers = [];
   bool _jobLoaded = false;
   final Map<String, int> _histVouchers = {}; // "VV-001 | 12-10-2026 · Ramesh" → voucher id
+  final Map<String, int> _histBranch = {}; // 🏢 voucher label → e voucher ni branch (company id)
+
+  // 🏢 BRANCH MERGE — dropdown ma BADHI pasand kareli branch na naam
+  List<String> _brCustomers = []; // customer / party (approval + sales, badhi branch)
+  bool _brCustLoaded = false;
+  final Map<String, Set<String>> _nameBranch = {}; // naam (lower) → kai branch(o) ma
   bool _histLoaded = false;
   static const String _histUrl = '${ApiConstants.baseUrl}voucher-history';
   String _labelStatus = 'all'; // item labels: all | printed | pending
@@ -382,6 +391,57 @@ class _ReportSheetState extends State<_ReportSheet> {
     return hasInfo ? _branchOf(r) : '';
   }
 
+  /// naam kai branch nu chhe e yaad rakho (dropdown ma batavva)
+  void _tagName(String name, Map r) {
+    final t = _branchTag(r);
+    if (name.isEmpty || name == '-' || t.isEmpty) return;
+    _nameBranch.putIfAbsent(name.toLowerCase(), () => <String>{}).add(t);
+  }
+
+  /// dropdown label: "Ramesh · Dishank Patel, Main" (value e j naam rahe)
+  String _tagged(String n) {
+    if (!_branchMode) return n;
+    final b = _nameBranch[n.toLowerCase()];
+    if (b == null || b.isEmpty) return n;
+    return '$n · ${(b.toList()..sort()).join(', ')}';
+  }
+
+  /// 🏢 badhi pasand kareli branch na customer (approval outstanding + sales)
+  Future<void> _loadBranchCustomers() async {
+    if (!_branchMode || _brCustLoaded) return;
+    if (mounted) setState(() => _listBusy = true);
+    try {
+      Future<List<Map>> safe(String path) async {
+        try {
+          return await _branchRows(path, const {});
+        } catch (e) {
+          debugPrint('🏢 BRANCH CUSTOMERS $path failed → $e');
+          return <Map>[];
+        }
+      }
+
+      final r = await Future.wait([
+        safe(ApiConstants.Approval_Outstanding_report),
+        safe(ApiConstants.Sale_Summary_report),
+      ]);
+      final names = <String>{};
+      for (final list in r) {
+        for (final m in list) {
+          final n = _Data.customerOf(m);
+          if (n.isEmpty || n == '-') continue;
+          names.add(n);
+          _tagName(n, m);
+        }
+      }
+      _brCustomers = names.toList()..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+      _brCustLoaded = true;
+      debugPrint('🏢 BRANCH CUSTOMERS → ${_brCustomers.length}');
+    } catch (e) {
+      debugPrint('🏢 BRANCH CUSTOMERS ERROR → $e');
+    }
+    if (mounted) setState(() => _listBusy = false);
+  }
+
   /// "Main 10 · Dishank 5" — for the summary under the PDF
   void _noteBranches(String what, Iterable<Map> rows) {
     if (!_branchMode) return;
@@ -412,9 +472,14 @@ class _ReportSheetState extends State<_ReportSheet> {
     _posLoaded = false;
     _posType = null;
     _workers.clear();
+    _brCustLoaded = false;
+    _brCustomers = [];
+    _nameBranch.clear();
+    _histBranch.clear();
     _customer = null;
     _custCtrl.clear();
     _fieldKey++;
+    if (_kind == _Kind.approval || _kind == _Kind.sale || _kind == _Kind.party) _loadBranchCustomers();
     if (_kind == _Kind.loss) _loadWorkers();
     if (_kind == _Kind.stock) _loadStockItems();
     if (_kind == _Kind.position) _loadPosition();
@@ -602,6 +667,8 @@ class _ReportSheetState extends State<_ReportSheet> {
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.white,
+      constraints: const BoxConstraints(maxWidth: 560), // 📱 tablet
+
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(10))),
       builder: (ctx) => StatefulBuilder(builder: (ctx, set) {
         final all = temp.length == _branches.length;
@@ -792,6 +859,7 @@ class _ReportSheetState extends State<_ReportSheet> {
     }
     if (mounted) setState(() => _loading = false);
     if (_kind == _Kind.sale || _kind == _Kind.party) _loadSaleCustomers();
+    if (_kind == _Kind.approval || _kind == _Kind.sale || _kind == _Kind.party) _loadBranchCustomers();
     if (_kind == _Kind.loss) _loadWorkers();
     if (_kind == _Kind.stock) _loadStockItems();
     if (_kind == _Kind.position) _loadPosition();
@@ -805,12 +873,42 @@ class _ReportSheetState extends State<_ReportSheet> {
     if (_histLoaded) return;
     if (mounted) setState(() => _listBusy = true);
     try {
-      final res =
-      await ApiHelper().getRequest(_br(_histUrl), showLoading: false, receiveTimeout: const Duration(seconds: 60));
-      final body = res?.data;
-      final d = body is Map ? body['data'] : null;
-      final list = (d is Map && d['vouchers'] is List) ? (d['vouchers'] as List).whereType<Map>() : const <Map>[];
+      // 🏢 branch merge → DAR branch alag (voucher-history?management_branches[]=<id>)
+      //    ane dar voucher ni branch yaad (PDF e j branch thi)
+      final List<Map> list = [];
+      if (_branchMode) {
+        Future<List<Map>> one(Company c) async {
+          try {
+            final res = await ApiHelper().getRequest('$_histUrl?management_branches[]=${c.id}',
+                showLoading: false, receiveTimeout: const Duration(seconds: 60));
+            final body = res?.data;
+            final d = body is Map ? body['data'] : null;
+            final l = (d is Map && d['vouchers'] is List) ? (d['vouchers'] as List).whereType<Map>() : const <Map>[];
+            return [
+              for (final v in l) {...v, if (v['company_id'] == null) 'company_id': c.id, '_bid': c.id},
+            ];
+          } catch (e) {
+            debugPrint('🧾 VOUCHERS ${c.name} failed → $e');
+            return <Map>[];
+          }
+        }
+
+        final parts = await Future.wait(_selBranches.map(one));
+        final seenV = <String>{};
+        for (final p in parts) {
+          for (final v in p) {
+            if (seenV.add('${v['company_id']}_${v['id']}')) list.add(v);
+          }
+        }
+      } else {
+        final res =
+        await ApiHelper().getRequest(_br(_histUrl), showLoading: false, receiveTimeout: const Duration(seconds: 60));
+        final body = res?.data;
+        final d = body is Map ? body['data'] : null;
+        if (d is Map && d['vouchers'] is List) list.addAll((d['vouchers'] as List).whereType<Map>());
+      }
       _histVouchers.clear();
+      _histBranch.clear();
       for (final v in list) {
         final id = int.tryParse('${v['id']}');
         if (id == null) continue;
@@ -825,6 +923,8 @@ class _ReportSheetState extends State<_ReportSheet> {
           label += ' ';
         }
         _histVouchers[label] = id;
+        final bid = int.tryParse('${v['company_id'] ?? v['_bid'] ?? ''}');
+        if (bid != null) _histBranch[label] = bid;
       }
       _histLoaded = true;
       _noteBranches('Vouchers', list);
@@ -940,6 +1040,9 @@ class _ReportSheetState extends State<_ReportSheet> {
     _jobSource = '';
     try {
       if (_branchMode && await _jobFromWorkerLoss()) {
+        for (final m in [..._jobIssues, ..._jobRecvs]) {
+          _tagName(_Job.workerOf(m), m);
+        }
         _jobWorkers = <String>{
           ..._jobIssues.map(_Job.workerOf),
         }.where((e) => e.isNotEmpty && e != '-').toList()
@@ -955,6 +1058,9 @@ class _ReportSheetState extends State<_ReportSheet> {
       ]);
       _jobIssues = r[0];
       _jobRecvs = r[1];
+      for (final m in [..._jobIssues, ..._jobRecvs]) {
+        _tagName(_Job.workerOf(m), m);
+      }
       _jobWorkers = <String>{
         ..._jobIssues.map(_Job.workerOf),
         ..._jobRecvs.map(_Job.workerOf),
@@ -1025,6 +1131,22 @@ class _ReportSheetState extends State<_ReportSheet> {
       );
       for (final g in _LedgerData.groups(res?.data, tag: _branchTag)) {
         _workers.putIfAbsent(g.worker, () => g.workerId);
+      }
+      // 🏢 branch merge → badhi branch na worker (worker-loss branch report thi)
+      //    naam "Ramesh · Dishank Patel" — ledger na naam jevu j
+      if (_branchMode) {
+        try {
+          final rows = await _branchRows(ApiConstants.worker_loss_report, const {});
+          for (final r in rows) {
+            final n = '${r['worker_name'] ?? r['jobworker_name'] ?? ''}'.trim();
+            if (n.isEmpty || n == '-' || n == 'null') continue;
+            final t = _branchTag(r);
+            final key = t.isEmpty ? n : '$n · $t';
+            _workers.putIfAbsent(key, () => int.tryParse('${r['worker_id'] ?? ''}'));
+          }
+        } catch (e) {
+          debugPrint('🏢 BRANCH WORKERS failed → $e');
+        }
       }
       _workersLoaded = true;
     } catch (_) {}
@@ -1145,12 +1267,12 @@ class _ReportSheetState extends State<_ReportSheet> {
   }
 
   List<String> get _options => switch (_kind) {
-    _Kind.approval => _customers,
-    _Kind.sale => _saleCustomers.isEmpty ? _customers : _saleCustomers,
+    _Kind.approval => _branchMode && _brCustLoaded ? _brCustomers : _customers,
+    _Kind.sale => _branchMode && _brCustLoaded ? _brCustomers : (_saleCustomers.isEmpty ? _customers : _saleCustomers),
     _Kind.loss => (_workers.keys.toList()..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()))),
     _Kind.stock => _stockItems,
     _Kind.position => _posItems,
-    _Kind.party => _saleCustomers.isEmpty ? _customers : _saleCustomers,
+    _Kind.party => _branchMode && _brCustLoaded ? _brCustomers : (_saleCustomers.isEmpty ? _customers : _saleCustomers),
     _Kind.label => _labelItems,
     _Kind.job => _jobWorkers,
     _Kind.history => _histVouchers.keys.toList(),
@@ -1179,6 +1301,7 @@ class _ReportSheetState extends State<_ReportSheet> {
       _summary = null;
     });
     if (k == _Kind.sale || k == _Kind.party) _loadSaleCustomers();
+    if (k == _Kind.approval || k == _Kind.sale || k == _Kind.party) _loadBranchCustomers();
     if (k == _Kind.loss) _loadWorkers();
     if (k == _Kind.job) _loadJob();
     if (k == _Kind.history) _loadHistVouchers();
@@ -1535,8 +1658,21 @@ class _ReportSheetState extends State<_ReportSheet> {
     }
     _start('Loading voucher history…');
     try {
-      final res = await ApiHelper().getRequest(_br('$_histUrl?voucher_id=$id'),
-          showLoading: false, receiveTimeout: const Duration(seconds: 60));
+      // 🏢 voucher ni potani branch pehla, pachhi dar branch, pachhi juni rit
+      final base = '$_histUrl?voucher_id=$id';
+      final bid = _customer == null ? null : _histBranch[_customer];
+      final tries = <String>{
+        if (_branchMode && bid != null) '$base&management_branches[]=$bid',
+        if (_branchMode) for (final c in _selBranches) '$base&management_branches[]=${c.id}',
+        _br(base),
+      }.toList();
+      dynamic res;
+      for (final u in tries) {
+        debugPrint('🧾 VOUCHER HISTORY PDF → $u');
+        res = await ApiHelper().getRequest(u, showLoading: false, receiveTimeout: const Duration(seconds: 60));
+        final b = res?.data;
+        if (res?.statusCode == 200 && b is Map && b['success'] != false && b['data'] is Map) break;
+      }
       final body = res?.data;
       if (body is! Map || body['success'] == false || body['data'] is! Map) {
         throw Exception(body is Map ? (body['message'] ?? 'No data') : 'No data');
@@ -1546,7 +1682,16 @@ class _ReportSheetState extends State<_ReportSheet> {
       final history = data['history'] is Map ? Map<String, dynamic>.from(data['history']) : <String, dynamic>{};
       final stages = _HistStage.all(history);
       setState(() => _progress = 'Making PDF…');
-      final file = await _ReportPdf.buildHistory(voucher: voucher, history: history, stages: stages);
+      // 🏢 voucher ni branch (header ma)
+      String? brName;
+      if (_branchMode) {
+        final b = bid ?? int.tryParse('${voucher['company_id'] ?? ''}');
+        for (final c in _branches) {
+          if (c.id == b) brName = c.name;
+        }
+        brName ??= voucher['company_id'] != null ? _branchOf(voucher) : null;
+      }
+      final file = await _ReportPdf.buildHistory(voucher: voucher, history: history, stages: stages, branch: brName);
       final vno = _Job.s(voucher['voucher_no']);
       final loss = stages.fold<double>(0, (a, s) => a + s.loss);
       _done(
@@ -1724,7 +1869,7 @@ class _ReportSheetState extends State<_ReportSheet> {
         final tg = _branchTag(m);
         lines.add(_LabelLine(
           label: _Data.text(m, const ['qr_code', 'label_code', 'barcode']),
-          item: (item.isEmpty ? '-' : item) + (tg.isEmpty ? '' : ' · $tg'),
+          item: item.isEmpty ? '-' : item,
           huid: _Data.text(m, const ['HUID', 'huid']),
           gross: _Data.number(m, const ['gross_weight']),
           other: _Data.number(m, const ['other_weight']),
@@ -1732,7 +1877,7 @@ class _ReportSheetState extends State<_ReportSheet> {
           printed: printed,
           created: created,
           printedAt: (pAt.isEmpty || pAt == 'null') ? '' : pAt,
-        ));
+        )..branch = tg);
       }
       // 📍 where is each label now? (barcode history · 8 at a time)
       await _findPlaces(lines);
@@ -1884,7 +2029,7 @@ class _ReportSheetState extends State<_ReportSheet> {
       final List<_StockLine> lines = list
           .map((s) => _StockLine(
         label: s.labelCode,
-        item: (tagOf[s] ?? '').isEmpty ? s.itemName : '${s.itemName} · ${tagOf[s]}',
+        item: s.itemName,
         huid: s.huid == '-' ? '' : s.huid,
         gross: s.grossWeight,
         other: s.otherWeight,
@@ -1894,7 +2039,7 @@ class _ReportSheetState extends State<_ReportSheet> {
         soldOn: s.soldOn,
         imageUrl: (s.imageDownloadUrl ?? '').trim().isNotEmpty ? s.imageDownloadUrl : s.imageUrl,
         imageUrl2: s.imageUrl,
-      ))
+      )..branch = tagOf[s] ?? '')
           .toList();
 
       // 🖼️ photos: 6 at a time
@@ -2180,6 +2325,7 @@ class _ReportSheetState extends State<_ReportSheet> {
         final l = _Data.line(it, voucher: vno, date: dText, isReturn: isReturn);
         if (fromRow && (l.item == '-' || l.item == vno)) l.item = 'Voucher total';
         if (party != null) l.status = party.isEmpty ? '-' : party;
+        l.branch = _branchTag(v); // 🏢 PDF ma Branch column
         return l;
       }).toList();
       done++;
@@ -2255,299 +2401,359 @@ class _ReportSheetState extends State<_ReportSheet> {
 
   @override
   Widget build(BuildContext context) {
-    final bottom = MediaQuery.of(context).viewInsets.bottom;
+    final mq = MediaQuery.of(context);
+    final bottom = mq.viewInsets.bottom;
     final meta = _meta(_kind);
-    return Padding(
-      padding: EdgeInsets.only(bottom: bottom),
-      child: SafeArea(
-        top: false,
-        child: ConstrainedBox(
-          constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.92),
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.fromLTRB(16, 10, 16, 18),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Center(
-                  child: Container(
-                      width: 40, height: 4, decoration: BoxDecoration(color: Colors.black12, borderRadius: BorderRadius.circular(10))),
-                ),
-                const SizedBox(height: 12),
-                // ---- header ----
-                Container(
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    gradient: const LinearGradient(
-                      colors: [Color(0xffEEF5FF), Color(0xffDCEAFF)],
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                    ),
-                    borderRadius: BorderRadius.circular(10),
-                    border: Border.all(color: _line),
+    // 📱 Responsive: nano phone · phone · tablet
+    final double sw = mq.size.width;
+    final double hp = sw < 360 ? 12 : (sw >= 600 ? 22 : 16);
+    final double sheetW = sw > 760 ? 760 : sw;
+    final double contentW = sheetW - 2 * hp;
+    final bool twoCol = contentW >= 620; // tablet → Customer + Range baju-baju
+    final double ddMax = (mq.size.height * 0.45).clamp(220.0, 350.0);
+    // Customer / Worker / Item pasand
+    final Widget whoBlock = Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      _label('2', _kind == _Kind.history ? 'Voucher' : _isWorkerKind ? 'Worker' : (_isItemKind ? 'Item' : (_kind == _Kind.party ? 'Party' : 'Customer'))),
+      PremiumSearchableDropdown<String>(
+        key: ValueKey('dd_${_fieldKey}_${_options.length}'),
+        label: '',
+        hint: _kind == _Kind.history ? 'Select voucher' : _isWorkerKind ? 'Select worker' : (_isItemKind ? 'Select item' : (_kind == _Kind.party ? 'Select party' : 'Select customer')),
+        items: _pickOne ? _options : [_allLabel, ..._options],
+        value: _pickOne ? _customer : (_customer ?? _allLabel),
+        // 🏢 branch merge → naam sathe branch pan dekhay
+        itemLabel: (n) => n == _allLabel ? n : _tagged(n),
+        searchText: (n) => n == _allLabel ? n : _tagged(n),
+        prefixIcon: _kind == _Kind.history
+            ? Icons.receipt_long_rounded
+            : _isWorkerKind
+            ? Icons.engineering_rounded
+            : ((_kind == _Kind.stock || _kind == _Kind.position)
+            ? Icons.diamond_outlined
+            : (_kind == _Kind.label ? Icons.qr_code_2_rounded : Icons.person_outline_rounded)),
+        dropdownMaxHeight: ddMax,
+        onChanged: (n) => setState(() {
+          _customer = (n == null || n == _allLabel) ? null : n;
+          _pdf = null;
+          _summary = null;
+        }),
+      ),
+      const SizedBox(height: 6),
+      Row(children: [
+        if (_listBusy) ...[
+          const SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 1.6, color: _blue)),
+          const SizedBox(width: 6),
+          const Flexible(
+            child: Text('Loading names…', style: TextStyle(fontSize: 11.5, color: _soft)),
+          ),
+        ] else
+          Flexible(
+            child: Text(
+              _customer == null
+                  ? (_kind == _Kind.party
+                  ? 'Select a party to see all its details'
+                  : (_kind == _Kind.history ? 'Select a voucher to see its full history' : _allLabel))
+                  : 'Selected: $_customer',
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 11.5, color: _customer == null ? _soft : _blue, fontWeight: FontWeight.w700),
+            ),
+          ),
+      ]),
+    ]);
+    // Range (voucher history ma nahi)
+    final Widget rangeBlock = Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      _label('3', 'Range'),
+      Wrap(spacing: 6, runSpacing: 6, children: [
+        if (_isItemKind) _rangeChip('all', 'All dates'),
+        _rangeChip('this_month', 'This month'),
+        _rangeChip('last_month', 'Last month'),
+        _rangeChip('last_3', 'Last 3 months'),
+        _rangeChip('fy', 'This FY'),
+        _monthPicker(),
+        _customChip(),
+      ]),
+      const SizedBox(height: 8),
+      Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(color: _bgSoft, borderRadius: BorderRadius.circular(10), border: Border.all(color: _line)),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          const Icon(Icons.event_rounded, size: 14, color: _blue),
+          const SizedBox(width: 6),
+          Flexible(
+            child: Text(_rangeText,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 11.5, color: _blue, fontWeight: FontWeight.w700)),
+          ),
+        ]),
+      ),
+    ]);
+    return MediaQuery.withClampedTextScaling(
+      // Phone ma moto font rakhyo hoy to pan layout na tute
+      minScaleFactor: 0.85,
+      maxScaleFactor: 1.25,
+      child: Padding(
+        padding: EdgeInsets.only(bottom: bottom),
+        child: SafeArea(
+          top: false,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(maxHeight: mq.size.height * 0.92),
+            child: SingleChildScrollView(
+              padding: EdgeInsets.fromLTRB(hp, 10, hp, 18),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Center(
+                    child: Container(
+                        width: 40, height: 4, decoration: BoxDecoration(color: Colors.black12, borderRadius: BorderRadius.circular(10))),
                   ),
-                  child: Row(children: [
-                    Container(
-                      width: 40,
-                      height: 40,
-                      decoration: BoxDecoration(
-                        gradient: const LinearGradient(colors: [Color(0xff60A5FA), _blue]),
-                        borderRadius: BorderRadius.circular(10),
-                        boxShadow: [BoxShadow(color: _blue.withOpacity(0.25), blurRadius: 10, offset: const Offset(0, 4))],
+                  const SizedBox(height: 12),
+                  // ---- header ----
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      gradient: const LinearGradient(
+                        colors: [Color(0xffEEF5FF), Color(0xffDCEAFF)],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
                       ),
-                      child: const Icon(Icons.summarize_rounded, color: Colors.white, size: 21),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: _line),
                     ),
-                    const SizedBox(width: 11),
-                    const Expanded(
-                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                        Text('Report builder', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800, color: _ink)),
-                        SizedBox(height: 2),
-                        Text('Pick a report · who · range → premium PDF',
-                            style: TextStyle(fontSize: 11.5, color: _soft)),
-                      ]),
-                    ),
-                    IconButton(
-                      tooltip: 'Close',
-                      onPressed: () => Navigator.pop(context),
-                      icon: const Icon(Icons.close_rounded, color: _soft),
-                    ),
-                  ]),
-                ),
-                const SizedBox(height: 16),
+                    child: Row(children: [
+                      Container(
+                        width: 40,
+                        height: 40,
+                        decoration: BoxDecoration(
+                          gradient: const LinearGradient(colors: [Color(0xff60A5FA), _blue]),
+                          borderRadius: BorderRadius.circular(10),
+                          boxShadow: [BoxShadow(color: _blue.withOpacity(0.25), blurRadius: 10, offset: const Offset(0, 4))],
+                        ),
+                        child: const Icon(Icons.summarize_rounded, color: Colors.white, size: 21),
+                      ),
+                      const SizedBox(width: 11),
+                      const Expanded(
+                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Text('Report builder', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800, color: _ink)),
+                          SizedBox(height: 2),
+                          Text('Pick a report · who · range → premium PDF',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(fontSize: 11.5, color: _soft)),
+                        ]),
+                      ),
+                      IconButton(
+                        tooltip: 'Close',
+                        onPressed: () => Navigator.pop(context),
+                        icon: const Icon(Icons.close_rounded, color: _soft),
+                      ),
+                    ]),
+                  ),
+                  const SizedBox(height: 16),
 
-                if (_loading)
-                  const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 30),
-                    child: Center(child: CircularProgressIndicator(color: _blue)),
-                  )
-                else if (_loadError != null && _kind == _Kind.approval)
-                  Text(_loadError!, style: const TextStyle(color: Colors.red))
-                else ...[
-                    // ---------------- 🏢 BRANCH ----------------
-                    _branchCard(),
+                  if (_loading)
+                    const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 30),
+                      child: Center(child: CircularProgressIndicator(color: _blue)),
+                    )
+                  else if (_loadError != null && _kind == _Kind.approval)
+                    Text(_loadError!, style: const TextStyle(color: Colors.red))
+                  else ...[
+                      // ---------------- 🏢 BRANCH ----------------
+                      _branchCard(),
 
-                    // ---------------- REPORT TYPE ----------------
-                    _label('1', 'Report'),
-                    // ↔️ horizontal scroll, compact cards
-                    LayoutBuilder(builder: (_, box) {
-                      const gap = 8.0;
-                      final n = _Kind.values.length;
-                      // 📱 wide screen (tablet) → all cards in one row, no scroll
-                      if (box.maxWidth >= n * 120 + (n - 1) * gap) {
-                        return IntrinsicHeight(
+                      // ---------------- REPORT TYPE ----------------
+                      _label('1', 'Report'),
+                      // ↔️ horizontal scroll, compact cards
+                      LayoutBuilder(builder: (_, box) {
+                        const gap = 8.0;
+                        final n = _Kind.values.length;
+                        // 📱 Tablet → badha card grid ma (scroll vagar)
+                        if (box.maxWidth >= 600 && box.maxWidth < n * 120 + (n - 1) * gap) {
+                          final int cols = box.maxWidth >= 700 ? 5 : 4;
+                          final double tw = (box.maxWidth - gap * (cols - 1)) / cols;
+                          return Wrap(spacing: gap, runSpacing: gap, children: [
+                            for (final k in _Kind.values) SizedBox(width: tw, child: _kindTile(k)),
+                          ]);
+                        }
+                        // 📱 wide screen (tablet) → all cards in one row, no scroll
+                        if (box.maxWidth >= n * 120 + (n - 1) * gap) {
+                          return IntrinsicHeight(
+                              child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                                for (var i = 0; i < n; i++) ...[
+                                  Expanded(child: _kindTile(_Kind.values[i])),
+                                  if (i < n - 1) const SizedBox(width: gap),
+                                ],
+                              ]));
+                        }
+                        // 📱 phone → horizontal scroll, ~2.6 cards visible (so you see there is more)
+                        final w = ((box.maxWidth - 2 * gap) / 2.6).clamp(104.0, 150.0);
+                        return SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          clipBehavior: Clip.none,
+                          padding: const EdgeInsets.only(right: 4, bottom: 4),
+                          child: IntrinsicHeight(
                             child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
                               for (var i = 0; i < n; i++) ...[
-                                Expanded(child: _kindTile(_Kind.values[i])),
+                                SizedBox(width: w, child: _kindTile(_Kind.values[i])),
                                 if (i < n - 1) const SizedBox(width: gap),
                               ],
-                            ]));
-                      }
-                      // 📱 phone → horizontal scroll, ~2.6 cards visible (so you see there is more)
-                      final w = ((box.maxWidth - 2 * gap) / 2.6).clamp(104.0, 150.0);
-                      return SingleChildScrollView(
-                        scrollDirection: Axis.horizontal,
-                        clipBehavior: Clip.none,
-                        padding: const EdgeInsets.only(right: 4, bottom: 4),
-                        child: IntrinsicHeight(
+                            ]),
+                          ),
+                        );
+                      }),
+                      const SizedBox(height: 16),
+
+                      // ---------------- CUSTOMER / WORKER + RANGE ----------------
+                      // 📱 Tablet → baju-baju · Phone → ek niche biju
+                      if (twoCol && _kind != _Kind.history)
+                        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Expanded(child: whoBlock),
+                          const SizedBox(width: 16),
+                          Expanded(child: rangeBlock),
+                        ])
+                      else ...[
+                        whoBlock,
+                        if (_kind != _Kind.history) ...[
+                          const SizedBox(height: 16),
+                          rangeBlock,
+                        ],
+                      ],
+                      const SizedBox(height: 16),
+
+                      // ---------------- ACTION ----------------
+                      _label(_kind == _Kind.history ? '3' : '4', 'Action'),
+                      if (_kind == _Kind.party) ...[
+                        _infoCard(meta.color, meta.icon,
+                            'One PDF with everything of this party\nSummary · approval issue · return · sold · sale bills · pending'),
+                        const SizedBox(height: 8),
+                        _check('Approval issue — item-wise', _doApproval, (v) => setState(() => _doApproval = v)),
+                        _check('Approval return — item-wise', _doReturn, (v) => setState(() => _doReturn = v)),
+                        _check('Sold from approval — item-wise', _doSold, (v) => setState(() => _doSold = v)),
+                        _check('Sale bills — item-wise', _doSale, (v) => setState(() => _doSale = v)),
+                      ] else if (_kind == _Kind.approval) ...[
+                        _check('Approval issue — item-wise', _doApproval, (v) => setState(() => _doApproval = v)),
+                        _check('Approval return — item-wise', _doReturn, (v) => setState(() => _doReturn = v)),
+                        _check('Sold from approval — item-wise', _doSold, (v) => setState(() => _doSold = v)),
+                      ] else if (_kind == _Kind.loss) ...[
+                        if (contentW < 340) ...[
+                          // 📱 nano phone → ek niche biju
+                          _formatTile('daily', Icons.calendar_view_day_rounded, 'Day wise ledger',
+                              'One line per day · Dr · Cr · balance'),
+                          const SizedBox(height: 8),
+                          _formatTile('detailed', Icons.list_alt_rounded, 'Detailed ledger',
+                              'Item-wise · voucher · issue / receive'),
+                        ] else
+                          IntrinsicHeight(
+                            child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                              Expanded(
+                                child: _formatTile('daily', Icons.calendar_view_day_rounded, 'Day wise ledger',
+                                    'One line per day · Dr · Cr · balance'),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: _formatTile('detailed', Icons.list_alt_rounded, 'Detailed ledger',
+                                    'Item-wise · voucher · issue / receive'),
+                              ),
+                            ]),
+                          ),
+                      ] else if (_kind == _Kind.history) ...[
+                        _infoCard(meta.color, meta.icon,
+                            'Full timeline of the selected voucher\nHeating · metal issue · casting receive · tree cutting office · '
+                                'tree cutting issue / receive · sorting · totals · loss'),
+                      ] else if (_kind == _Kind.job) ...[
+                        _check('Job work issue — voucher-wise', _doJobIssue, (v) => setState(() {
+                          _doJobIssue = v;
+                          _pdf = null;
+                        })),
+                        _check('Job work receive — voucher-wise', _doJobReceive, (v) => setState(() {
+                          _doJobReceive = v;
+                          _pdf = null;
+                        })),
+                        const SizedBox(height: 6),
+                        AnimatedSize(
+                          duration: const Duration(milliseconds: 200),
+                          child: _doJobIssue && _doJobReceive
+                              ? _infoCard(meta.color, Icons.balance_rounded,
+                              'Both selected → PDF also shows LOSS / PROFIT\nIssued − received − pending · voucher-wise + worker-wise')
+                              : const SizedBox(width: double.infinity),
+                        ),
+                      ] else if (_kind == _Kind.label) ...[
+                        IntrinsicHeight(
                           child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-                            for (var i = 0; i < n; i++) ...[
-                              SizedBox(width: w, child: _kindTile(_Kind.values[i])),
-                              if (i < n - 1) const SizedBox(width: gap),
-                            ],
+                            Expanded(child: _labelTile('all', Icons.all_inclusive_rounded, 'All', 'Created')),
+                            const SizedBox(width: 8),
+                            Expanded(child: _labelTile('printed', Icons.print_rounded, 'Printed', 'Label printed')),
+                            const SizedBox(width: 8),
+                            Expanded(child: _labelTile('pending', Icons.pending_actions_rounded, 'Pending', 'Not printed')),
                           ]),
                         ),
-                      );
-                    }),
-                    const SizedBox(height: 16),
-
-                    // ---------------- CUSTOMER / WORKER ----------------
-                    _label('2', _kind == _Kind.history ? 'Voucher' : _isWorkerKind ? 'Worker' : (_isItemKind ? 'Item' : (_kind == _Kind.party ? 'Party' : 'Customer'))),
-                    PremiumSearchableDropdown<String>(
-                      key: ValueKey('dd_${_fieldKey}_${_options.length}'),
-                      label: '',
-                      hint: _kind == _Kind.history ? 'Select voucher' : _isWorkerKind ? 'Select worker' : (_isItemKind ? 'Select item' : (_kind == _Kind.party ? 'Select party' : 'Select customer')),
-                      items: _pickOne ? _options : [_allLabel, ..._options],
-                      value: _pickOne ? _customer : (_customer ?? _allLabel),
-                      itemLabel: (n) => n,
-                      searchText: (n) => n,
-                      prefixIcon: _kind == _Kind.history
-                          ? Icons.receipt_long_rounded
-                          : _isWorkerKind
-                          ? Icons.engineering_rounded
-                          : ((_kind == _Kind.stock || _kind == _Kind.position)
-                          ? Icons.diamond_outlined
-                          : (_kind == _Kind.label ? Icons.qr_code_2_rounded : Icons.person_outline_rounded)),
-                      dropdownMaxHeight: 350,
-                      onChanged: (n) => setState(() {
-                        _customer = (n == null || n == _allLabel) ? null : n;
-                        _pdf = null;
-                        _summary = null;
-                      }),
-                    ),
-                    const SizedBox(height: 6),
-                    Row(children: [
-                      if (_listBusy) ...[
-                        const SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 1.6, color: _blue)),
-                        const SizedBox(width: 6),
-                        const Text('Loading names…', style: TextStyle(fontSize: 11.5, color: _soft)),
-                      ] else
+                        const SizedBox(height: 6),
+                        const Text(
+                          'PDF: where now (in stock · approval · sold · sold from approval · returned) · item-wise count · '
+                              'date wise list · label · item · HUID · weights · print status · voucher',
+                          style: TextStyle(fontSize: 10.5, color: _soft),
+                        ),
+                      ] else if (_kind == _Kind.position) ...[
+                        _infoCard(meta.color, meta.icon,
+                            'Current stock — item-wise · stock type wise\n'
+                                '${_branchMode ? 'One section per branch + branch wise overview' : 'Pcs · gross · less · net · fine · labour · other'}'),
+                        const SizedBox(height: 10),
+                        const Text('Stock type',
+                            style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w700, color: _soft)),
+                        const SizedBox(height: 6),
+                        Wrap(spacing: 6, runSpacing: 6, children: [
+                          _posChip(null, 'All types'),
+                          for (final t in _posTypes) _posChip(t.key, t.name),
+                        ]),
+                        const SizedBox(height: 6),
+                        const Text(
+                          'PDF: branch wise · stock type wise · item · customer · pcs · image / no image · '
+                              'gross · less · net · fine · labour · other',
+                          style: TextStyle(fontSize: 10.5, color: _soft),
+                        ),
+                      ] else if (_kind == _Kind.stock) ...[
+                        IntrinsicHeight(
+                          child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                            Expanded(child: _stockTile('all', Icons.all_inclusive_rounded, 'All', 'In + sold')),
+                            const SizedBox(width: 8),
+                            Expanded(child: _stockTile('in', Icons.inventory_rounded, 'In stock', 'Available')),
+                            const SizedBox(width: 8),
+                            Expanded(child: _stockTile('out', Icons.sell_rounded, 'Out of stock', 'Sold')),
+                          ]),
+                        ),
+                        // In stock → 2 more options: With image / Without image
+                        AnimatedSize(
+                          duration: const Duration(milliseconds: 200),
+                          curve: Curves.easeOut,
+                          child: _stockStatus == 'in'
+                              ? Padding(padding: const EdgeInsets.only(top: 8), child: _photoChoice())
+                              : const SizedBox(width: double.infinity),
+                        ),
+                        const SizedBox(height: 6),
                         Text(
-                          _customer == null
-                              ? (_kind == _Kind.party
-                              ? 'Select a party to see all its details'
-                              : (_kind == _Kind.history ? 'Select a voucher to see its full history' : _allLabel))
-                              : 'Selected: $_customer',
-                          style: TextStyle(fontSize: 11.5, color: _customer == null ? _soft : _blue, fontWeight: FontWeight.w700),
+                          _stockStatus == 'out'
+                              ? 'PDF: date wise by sold date · label · item · HUID · gross · other · net'
+                              : 'PDF: date wise by added date · label · item · HUID · gross · other · net'
+                              '${_stockStatus == 'in' && _photo == 'with' ? ' · photo' : ''}',
+                          style: const TextStyle(fontSize: 10.5, color: _soft),
                         ),
-                    ]),
-                    const SizedBox(height: 16),
-
-                    // ---------------- RANGE (not for voucher history) ----------------
-                    if (_kind != _Kind.history) ...[
-                      _label('3', 'Range'),
-                      Wrap(spacing: 6, runSpacing: 6, children: [
-                        if (_isItemKind) _rangeChip('all', 'All dates'),
-                        _rangeChip('this_month', 'This month'),
-                        _rangeChip('last_month', 'Last month'),
-                        _rangeChip('last_3', 'Last 3 months'),
-                        _rangeChip('fy', 'This FY'),
-                        _monthPicker(),
-                        _customChip(),
-                      ]),
-                      const SizedBox(height: 8),
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                        decoration: BoxDecoration(color: _bgSoft, borderRadius: BorderRadius.circular(10), border: Border.all(color: _line)),
-                        child: Row(mainAxisSize: MainAxisSize.min, children: [
-                          const Icon(Icons.event_rounded, size: 14, color: _blue),
-                          const SizedBox(width: 6),
-                          Text(_rangeText, style: const TextStyle(fontSize: 11.5, color: _blue, fontWeight: FontWeight.w700)),
-                        ]),
-                      ),
+                      ] else
+                        _infoCard(meta.color, meta.icon,
+                            'Sale bills — item-wise\nVoucher · item · qty · gross · less · net · labour · metal · amount · customer'),
                       const SizedBox(height: 16),
+
+                      // ---------------- MAKE ----------------
+                      _makeButton(meta),
+
+                      if (_pdf != null) ...[
+                        const SizedBox(height: 14),
+                        _resultCard(),
+                      ],
                     ],
-
-                    // ---------------- ACTION ----------------
-                    _label(_kind == _Kind.history ? '3' : '4', 'Action'),
-                    if (_kind == _Kind.party) ...[
-                      _infoCard(meta.color, meta.icon,
-                          'One PDF with everything of this party\nSummary · approval issue · return · sold · sale bills · pending'),
-                      const SizedBox(height: 8),
-                      _check('Approval issue — item-wise', _doApproval, (v) => setState(() => _doApproval = v)),
-                      _check('Approval return — item-wise', _doReturn, (v) => setState(() => _doReturn = v)),
-                      _check('Sold from approval — item-wise', _doSold, (v) => setState(() => _doSold = v)),
-                      _check('Sale bills — item-wise', _doSale, (v) => setState(() => _doSale = v)),
-                    ] else if (_kind == _Kind.approval) ...[
-                      _check('Approval issue — item-wise', _doApproval, (v) => setState(() => _doApproval = v)),
-                      _check('Approval return — item-wise', _doReturn, (v) => setState(() => _doReturn = v)),
-                      _check('Sold from approval — item-wise', _doSold, (v) => setState(() => _doSold = v)),
-                    ] else if (_kind == _Kind.loss) ...[
-                      Row(children: [
-                        Expanded(
-                          child: _formatTile('daily', Icons.calendar_view_day_rounded, 'Day wise ledger',
-                              'One line per day · Dr · Cr · balance'),
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: _formatTile('detailed', Icons.list_alt_rounded, 'Detailed ledger',
-                              'Item-wise · voucher · issue / receive'),
-                        ),
-                      ]),
-                    ] else if (_kind == _Kind.history) ...[
-                      _infoCard(meta.color, meta.icon,
-                          'Full timeline of the selected voucher\nHeating · metal issue · casting receive · tree cutting office · '
-                              'tree cutting issue / receive · sorting · totals · loss'),
-                    ] else if (_kind == _Kind.job) ...[
-                      _check('Job work issue — voucher-wise', _doJobIssue, (v) => setState(() {
-                        _doJobIssue = v;
-                        _pdf = null;
-                      })),
-                      _check('Job work receive — voucher-wise', _doJobReceive, (v) => setState(() {
-                        _doJobReceive = v;
-                        _pdf = null;
-                      })),
-                      const SizedBox(height: 6),
-                      AnimatedSize(
-                        duration: const Duration(milliseconds: 200),
-                        child: _doJobIssue && _doJobReceive
-                            ? _infoCard(meta.color, Icons.balance_rounded,
-                            'Both selected → PDF also shows LOSS / PROFIT\nIssued − received − pending · voucher-wise + worker-wise')
-                            : const SizedBox(width: double.infinity),
-                      ),
-                    ] else if (_kind == _Kind.label) ...[
-                      IntrinsicHeight(
-                        child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-                          Expanded(child: _labelTile('all', Icons.all_inclusive_rounded, 'All', 'Created')),
-                          const SizedBox(width: 8),
-                          Expanded(child: _labelTile('printed', Icons.print_rounded, 'Printed', 'Label printed')),
-                          const SizedBox(width: 8),
-                          Expanded(child: _labelTile('pending', Icons.pending_actions_rounded, 'Pending', 'Not printed')),
-                        ]),
-                      ),
-                      const SizedBox(height: 6),
-                      const Text(
-                        'PDF: where now (in stock · approval · sold · sold from approval · returned) · item-wise count · '
-                            'date wise list · label · item · HUID · weights · print status · voucher',
-                        style: TextStyle(fontSize: 10.5, color: _soft),
-                      ),
-                    ] else if (_kind == _Kind.position) ...[
-                      _infoCard(meta.color, meta.icon,
-                          'Current stock — item-wise · stock type wise\n'
-                              '${_branchMode ? 'One section per branch + branch wise overview' : 'Pcs · gross · less · net · fine · labour · other'}'),
-                      const SizedBox(height: 10),
-                      const Text('Stock type',
-                          style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w700, color: _soft)),
-                      const SizedBox(height: 6),
-                      Wrap(spacing: 6, runSpacing: 6, children: [
-                        _posChip(null, 'All types'),
-                        for (final t in _posTypes) _posChip(t.key, t.name),
-                      ]),
-                      const SizedBox(height: 6),
-                      const Text(
-                        'PDF: branch wise · stock type wise · item · customer · pcs · image / no image · '
-                            'gross · less · net · fine · labour · other',
-                        style: TextStyle(fontSize: 10.5, color: _soft),
-                      ),
-                    ] else if (_kind == _Kind.stock) ...[
-                      IntrinsicHeight(
-                        child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-                          Expanded(child: _stockTile('all', Icons.all_inclusive_rounded, 'All', 'In + sold')),
-                          const SizedBox(width: 8),
-                          Expanded(child: _stockTile('in', Icons.inventory_rounded, 'In stock', 'Available')),
-                          const SizedBox(width: 8),
-                          Expanded(child: _stockTile('out', Icons.sell_rounded, 'Out of stock', 'Sold')),
-                        ]),
-                      ),
-                      // In stock → 2 more options: With image / Without image
-                      AnimatedSize(
-                        duration: const Duration(milliseconds: 200),
-                        curve: Curves.easeOut,
-                        child: _stockStatus == 'in'
-                            ? Padding(padding: const EdgeInsets.only(top: 8), child: _photoChoice())
-                            : const SizedBox(width: double.infinity),
-                      ),
-                      const SizedBox(height: 6),
-                      Text(
-                        _stockStatus == 'out'
-                            ? 'PDF: date wise by sold date · label · item · HUID · gross · other · net'
-                            : 'PDF: date wise by added date · label · item · HUID · gross · other · net'
-                            '${_stockStatus == 'in' && _photo == 'with' ? ' · photo' : ''}',
-                        style: const TextStyle(fontSize: 10.5, color: _soft),
-                      ),
-                    ] else
-                      _infoCard(meta.color, meta.icon,
-                          'Sale bills — item-wise\nVoucher · item · qty · gross · less · net · labour · metal · amount · customer'),
-                    const SizedBox(height: 16),
-
-                    // ---------------- MAKE ----------------
-                    _makeButton(meta),
-
-                    if (_pdf != null) ...[
-                      const SizedBox(height: 14),
-                      _resultCard(),
-                    ],
-                  ],
-              ],
+                ],
+              ),
             ),
           ),
         ),
@@ -2810,7 +3016,10 @@ class _ReportSheetState extends State<_ReportSheet> {
                 if (on) const Icon(Icons.check_circle_rounded, size: 15, color: c),
               ]),
               const SizedBox(height: 2),
-              Text(sub, maxLines: 2, style: const TextStyle(fontSize: 10, color: _soft, height: 1.3)),
+              Text(sub,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 10, color: _soft, height: 1.3)),
             ]),
           ),
         ]),
@@ -2849,8 +3058,7 @@ class _ReportSheetState extends State<_ReportSheet> {
       borderRadius: BorderRadius.circular(10),
       onTap: _busy ? null : _generate,
       child: Ink(
-        height: 52,
-        padding: const EdgeInsets.symmetric(horizontal: 12),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
         decoration: BoxDecoration(
           borderRadius: BorderRadius.circular(10),
           gradient: const LinearGradient(
@@ -2876,6 +3084,8 @@ class _ReportSheetState extends State<_ReportSheet> {
           Expanded(
             child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
               Text(_busy ? 'Preparing…' : 'Make ${meta.title} PDF',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                   style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w800)),
               Text(_busy ? _progress : '${_customer ?? _allLabel} · $_rangeText',
                   maxLines: 1,
@@ -2915,7 +3125,7 @@ class _ReportSheetState extends State<_ReportSheet> {
             ),
             onPressed: () => OpenFile.open(_pdf!.path),
             icon: const Icon(Icons.open_in_new_rounded, size: 17),
-            label: const Text('Open'),
+            label: const FittedBox(fit: BoxFit.scaleDown, child: Text('Open')),
           ),
         ),
         const SizedBox(width: 8),
@@ -2927,7 +3137,7 @@ class _ReportSheetState extends State<_ReportSheet> {
             ),
             onPressed: () => Share.shareXFiles([XFile(_pdf!.path)], text: '${_meta(_kind).title} report'),
             icon: const Icon(Icons.share_rounded, size: 17),
-            label: const Text('Share'),
+            label: const FittedBox(fit: BoxFit.scaleDown, child: Text('Share')),
           ),
         ),
       ]),
@@ -2948,7 +3158,12 @@ class _ReportSheetState extends State<_ReportSheet> {
         child: Text(n, style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w800)),
       ),
       const SizedBox(width: 8),
-      Text(t, style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w800, color: _ink)),
+      Expanded(
+        child: Text(t,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w800, color: _ink)),
+      ),
     ]),
   );
 
@@ -3226,6 +3441,7 @@ class _LabelLine {
   String place = ''; // In stock | On approval | Sold | Sold from approval | Returned
   String placeVoucher = '';
   String placeDate = '';
+  String branch = ''; // 🏢 branch merge
   _LabelLine({
     required this.label,
     required this.item,
@@ -3332,6 +3548,7 @@ class _StockLine {
   final String? imageUrl; // download url (preferred)
   final String? imageUrl2; // gallery url (fallback)
   pw.MemoryImage? image;
+  String branch = ''; // 🏢 branch merge
   _StockLine({
     required this.label,
     required this.item,
@@ -3607,6 +3824,7 @@ class _ReportPdf {
     String photoMode = 'any', // any | with | without
     required List<_StockLine> lines,
   }) async {
+    final bool hbS = lines.any((l) => l.branch.isNotEmpty); // 🏢 Branch column
     final brand = await _brand();
     final doc = pw.Document();
     final made = DateFormat('dd-MM-yyyy hh:mm a').format(DateTime.now());
@@ -3725,6 +3943,7 @@ class _ReportPdf {
             cell('Net (g)', head: true),
             if (status != 'in') cell('Sold on', head: true, left: true),
             cell('Status', head: true, left: true),
+            if (hbS) cell('Branch', head: true, left: true),
           ],
         ),
       ];
@@ -3773,6 +3992,7 @@ class _ReportPdf {
             cell(w(l.net), bold: true),
             if (status != 'in') cell(l.soldOn == null ? '-' : DateFormat('dd-MM-yyyy').format(l.soldOn!), left: true),
             statusCell(l),
+            if (hbS) cell(l.branch.isEmpty ? '-' : l.branch, left: true, bold: true, color: _navy),
           ],
         ));
       }
@@ -3789,6 +4009,7 @@ class _ReportPdf {
           cell(w(sum(ls, (l) => l.net)), bold: true, color: _navy),
           if (status != 'in') cell(''),
           cell(''),
+          if (hbS) cell(''),
         ],
       ));
 
@@ -3805,6 +4026,7 @@ class _ReportPdf {
           (withImages ? 7 : 6): const pw.FlexColumnWidth(1.0),
           if (status != 'in') (withImages ? 8 : 7): const pw.FlexColumnWidth(1.0),
           (withImages ? (status != 'in' ? 9 : 8) : (status != 'in' ? 8 : 7)): const pw.FlexColumnWidth(0.9),
+          if (hbS) (withImages ? (status != 'in' ? 10 : 9) : (status != 'in' ? 9 : 8)): const pw.FlexColumnWidth(1.1),
         },
         children: rows,
       ));
@@ -4098,6 +4320,7 @@ class _ReportPdf {
     required Map<String, dynamic> voucher,
     required Map<String, dynamic> history,
     required List<_HistStage> stages,
+    String? branch, // 🏢 branch merge → voucher kai branch no
   }) async {
     final brand = await _brand();
     final doc = pw.Document();
@@ -4138,6 +4361,7 @@ class _ReportPdf {
             color: _cream, border: pw.Border.all(color: _line), borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6))),
         child: pw.Row(children: [
           _kv('Voucher No', vno),
+          if (branch != null && branch.isNotEmpty) _kv('Branch', branch),
           _kv('Voucher Date', val([voucher['voucher_date_view'], voucher['voucher_date']])),
           _kv('Process', val([voucher['process_name']])),
           _kv('Worker', val([voucher['worker_name']])),
@@ -4281,6 +4505,8 @@ class _ReportPdf {
     required bool showIssue,
     required bool showReceive,
   }) async {
+    // 🏢 branch merge → voucher sathe Branch column
+    final bool hbJ = issues.any((e) => e.branch.isNotEmpty) || recvs.any((e) => e.branch.isNotEmpty);
     final brand = await _brand();
     final doc = pw.Document();
     final made = DateFormat('dd-MM-yyyy hh:mm a').format(DateTime.now());
@@ -4390,6 +4616,7 @@ class _ReportPdf {
               cell('Pcs', head: true),
               cell('Gross (g)', head: true),
               cell('Net (g)', head: true),
+              if (hbJ) cell('Branch', head: true, left: true),
             ]),
           ];
           for (var i = 0; i < issues.length; i++) {
@@ -4404,6 +4631,7 @@ class _ReportPdf {
               cell(e.pcs == 0 ? '-' : q(e.pcs)),
               cell(w(e.gross)),
               cell(w(e.net), bold: true),
+              if (hbJ) cell(e.branch.isEmpty ? '-' : e.branch, left: true, bold: true, color: _navy),
             ]));
           }
           rows.add(pw.TableRow(decoration: const pw.BoxDecoration(color: _goldSoft), children: [
@@ -4416,19 +4644,21 @@ class _ReportPdf {
             cell(q(si(issues, (e) => e.pcs)), bold: true),
             cell(w(si(issues, (e) => e.gross)), bold: true),
             cell(w(si(issues, (e) => e.net)), bold: true, color: _navy),
+            if (hbJ) cell(''),
           ]));
           content.add(pw.Table(
             border: pw.TableBorder.all(color: _line, width: 0.5),
-            columnWidths: const {
-              0: pw.FixedColumnWidth(24),
-              1: pw.FlexColumnWidth(0.95),
-              2: pw.FlexColumnWidth(1.1),
-              3: pw.FlexColumnWidth(1.4),
-              4: pw.FlexColumnWidth(1.1),
-              5: pw.FlexColumnWidth(2.2),
-              6: pw.FlexColumnWidth(0.6),
-              7: pw.FlexColumnWidth(0.95),
-              8: pw.FlexColumnWidth(0.95),
+            columnWidths: {
+              0: const pw.FixedColumnWidth(24),
+              1: const pw.FlexColumnWidth(0.95),
+              2: const pw.FlexColumnWidth(1.1),
+              3: const pw.FlexColumnWidth(1.4),
+              4: const pw.FlexColumnWidth(1.1),
+              5: const pw.FlexColumnWidth(2.2),
+              6: const pw.FlexColumnWidth(0.6),
+              7: const pw.FlexColumnWidth(0.95),
+              8: const pw.FlexColumnWidth(0.95),
+              if (hbJ) 9: const pw.FlexColumnWidth(1.1),
             },
             children: rows,
           ));
@@ -4455,6 +4685,7 @@ class _ReportPdf {
               cell('Pending (g)', head: true),
               if (both) cell('Loss / Profit (g)', head: true),
               cell('Status', head: true, left: true),
+              if (hbJ) cell('Branch', head: true, left: true),
             ]),
           ];
           for (var i = 0; i < recvs.length; i++) {
@@ -4473,6 +4704,7 @@ class _ReportPdf {
                 cell(e.pending > 0.0005 ? w(e.pending) : '-', color: e.pending > 0.0005 ? _orange : _grey),
                 if (both) cell(lp(e.lossGain), bold: true, color: lpColor(e.lossGain)),
                 statusBadge(e),
+                if (hbJ) cell(e.branch.isEmpty ? '-' : e.branch, left: true, bold: true, color: _navy),
               ],
             ));
           }
@@ -4487,6 +4719,7 @@ class _ReportPdf {
             cell(w(sumR(recvs, (e) => e.pending)), bold: true, color: _orange),
             if (both) cell(lp(sumR(recvs, (e) => e.lossGain)), bold: true, color: lpColor(sumR(recvs, (e) => e.lossGain))),
             cell(''),
+            if (hbJ) cell(''),
           ]));
           content.add(pw.Table(
             border: pw.TableBorder.all(color: _line, width: 0.5),
@@ -4501,6 +4734,7 @@ class _ReportPdf {
               7: const pw.FlexColumnWidth(0.9),
               if (both) 8: const pw.FlexColumnWidth(1.1),
               (both ? 9 : 8): const pw.FlexColumnWidth(0.9),
+              if (hbJ) (both ? 10 : 9): const pw.FlexColumnWidth(1.1),
             },
             children: rows,
           ));
@@ -4688,9 +4922,11 @@ class _ReportPdf {
       groups.putIfAbsent(l.created == null ? 'No date' : DateFormat('dd-MM-yyyy').format(l.created!), () => []).add(l);
     }
     // ---- item wise count ----
+    final bool hbL = lines.any((l) => l.branch.isNotEmpty); // 🏢 Branch column
     final byItem = <String, List<_LabelLine>>{};
     for (final l in lines) {
-      byItem.putIfAbsent(l.item, () => []).add(l);
+      // item wise: branch merge ma dar branch nu alag (pehla jem)
+      byItem.putIfAbsent(l.branch.isEmpty ? l.item : '${l.item} · ${l.branch}', () => []).add(l);
     }
     final itemKeys = byItem.keys.toList()..sort((a, b) => byItem[b]!.length.compareTo(byItem[a]!.length));
 
@@ -4949,6 +5185,7 @@ class _ReportPdf {
           cell('Print', head: true, left: true),
           cell('Printed on', head: true, left: true),
           cell('Now at · voucher', head: true, left: true),
+          if (hbL) cell('Branch', head: true, left: true),
         ]),
       ];
       for (var i = 0; i < ls.length; i++) {
@@ -4968,6 +5205,7 @@ class _ReportPdf {
             statusCell(l.printed),
             cell(l.printed && l.printedAt.isNotEmpty ? l.printedAt : '-', left: true, color: _grey),
             placeCell(l),
+            if (hbL) cell(l.branch.isEmpty ? '-' : l.branch, left: true, bold: true, color: _navy),
           ],
         ));
       }
@@ -4982,20 +5220,22 @@ class _ReportPdf {
         cell(''),
         cell(''),
         cell(''),
+        if (hbL) cell(''),
       ]));
       content.add(pw.Table(
         border: pw.TableBorder.all(color: _line, width: 0.5),
-        columnWidths: const {
-          0: pw.FixedColumnWidth(24),
-          1: pw.FlexColumnWidth(1.1),
-          2: pw.FlexColumnWidth(2.0),
-          3: pw.FlexColumnWidth(1.0),
-          4: pw.FlexColumnWidth(0.8),
-          5: pw.FlexColumnWidth(0.75),
-          6: pw.FlexColumnWidth(0.8),
-          7: pw.FlexColumnWidth(0.8),
-          8: pw.FlexColumnWidth(1.25),
-          9: pw.FlexColumnWidth(1.7),
+        columnWidths: {
+          0: const pw.FixedColumnWidth(24),
+          1: const pw.FlexColumnWidth(1.1),
+          2: const pw.FlexColumnWidth(2.0),
+          3: const pw.FlexColumnWidth(1.0),
+          4: const pw.FlexColumnWidth(0.8),
+          5: const pw.FlexColumnWidth(0.75),
+          6: const pw.FlexColumnWidth(0.8),
+          7: const pw.FlexColumnWidth(0.8),
+          8: const pw.FlexColumnWidth(1.25),
+          9: const pw.FlexColumnWidth(1.7),
+          if (hbL) 10: const pw.FlexColumnWidth(1.1),
         },
         children: rows,
       ));
@@ -5551,9 +5791,12 @@ class _ReportPdf {
   }
 
   static pw.Widget _table(_Section s, {String lastCol = 'Status'}) {
-    final heads = ['#', 'Voucher / Date', 'Item', 'Qty', 'Gross', 'Less', 'Net', 'Labour Rate', 'Metal Rate', 'Amount', 'Other Amt', lastCol];
+    // 🏢 branch merge → chhelle "Branch" column (kai branch nu item / voucher)
+    final hb = s.lines.any((l) => l.branch.isNotEmpty);
+    final heads = ['#', 'Voucher / Date', 'Item', 'Qty', 'Gross', 'Less', 'Net', 'Labour Rate', 'Metal Rate', 'Amount', 'Other Amt', lastCol,
+      if (hb) 'Branch'];
     final statusCol = lastCol == 'Status';
-    const widths = [0.35, 1.5, 2.2, 0.5, 0.85, 0.75, 0.85, 0.9, 0.95, 1.1, 0.9, 0.85];
+    final widths = [0.35, 1.5, 2.2, 0.5, 0.85, 0.75, 0.85, 0.9, 0.95, 1.1, 0.9, 0.85, if (hb) 1.1];
     final rightCols = {3, 4, 5, 6, 7, 8, 9, 10};
 
     pw.Widget cell(String t, int col, {bool head = false, PdfColor? color, bool bold = false}) => pw.Padding(
@@ -5599,6 +5842,7 @@ class _ReportPdf {
           cell(a(l.amount), 9, bold: true),
           cell(a(l.other), 10),
           cell(l.status, 11, color: stColor(l.status), bold: statusCol),
+          if (hb) cell(l.branch.isEmpty ? '-' : l.branch, 12, color: _navy, bold: true),
         ],
       ));
     }
@@ -5618,6 +5862,7 @@ class _ReportPdf {
         cell(a(s.sum((l) => l.amount)), 9, bold: true),
         cell(a(s.sum((l) => l.other)), 10, bold: true),
         cell('', 11),
+        if (hb) cell('', 12),
       ],
     ));
 
