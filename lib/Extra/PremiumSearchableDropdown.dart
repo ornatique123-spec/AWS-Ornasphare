@@ -27,9 +27,16 @@ class PremiumSearchableDropdown<T> extends StatefulWidget {
   /// Maximum dropdown height
   final double dropdownMaxHeight;
 
+
   /// ✅ Dropdown (popup) ni width — na aapo to field jetli j.
   /// Field karta nani hoy to field jetli j rahe.
   final double? menuWidth;
+
+  /// 🔍 Keyboard na search button par typed text parent ne aape.
+  /// Aapo to: dropdown bandh thay ane query parent ne male
+  /// (e.g. "watch" → badhi matching items list ma).
+  /// Na aapo to juno behaviour (1 item hoy to select).
+  final ValueChanged<String>? onSearchSubmitted;
 
   const PremiumSearchableDropdown({
     super.key,
@@ -46,6 +53,7 @@ class PremiumSearchableDropdown<T> extends StatefulWidget {
     this.width,
     this.dropdownMaxHeight = 300,
     this.menuWidth,
+    this.onSearchSubmitted,
   });
 
   @override
@@ -343,15 +351,25 @@ class _PremiumSearchableDropdownState<T>
   /// ============================================================
   /// 🔍 KEYBOARD NU SEARCH BUTTON
   ///
-  /// - Lakhela text thi list filter
-  /// - Ek j item male, athva naam barabar match thay → select + close
+  /// - onSearchSubmitted aapyu hoy → dropdown bandh + query parent ne
+  ///   (parent badhi matching items list ma batave)
+  /// - Nahi to: ek j item male, athva naam barabar match thay → select
   /// - Vadhare male → keyboard band, list dekhay (user pasand kare)
   /// ============================================================
 
   void _onSearchSubmitted(String value) {
+    final String raw = value.trim();
+
+    /// 🔥 Parent e callback aapyu hoy → badhi matching items parent ne
+    if (widget.onSearchSubmitted != null && raw.isNotEmpty) {
+      _closeDropdown();
+      widget.onSearchSubmitted!(raw);
+      return;
+    }
+
     _search(value);
 
-    final String query = value.trim().toLowerCase();
+    final String query = raw.toLowerCase();
 
     if (query.isEmpty) {
       _searchFocusNode.unfocus();

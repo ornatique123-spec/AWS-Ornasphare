@@ -1,7 +1,11 @@
 
 class ApiConstants {
-  // Base URL
+  // Base URL ( AWS )
+
   static const String baseUrl = 'https://ornasphere.com/api/';
+
+  // Base URL ( Development )
+  //static const String baseUrl = 'https://dev.ornasphere.com/api/';
 
   // API Endpoints
   static const String login = 'company/login';

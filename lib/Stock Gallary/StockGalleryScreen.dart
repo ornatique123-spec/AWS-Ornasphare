@@ -85,6 +85,11 @@ class _StockGalleryScreenState extends State<StockGalleryScreen> {
   /// =========================================================
 
   String selectedItem = "All Items";
+
+  /// 🔍 Item dropdown ma keyboard search thi aavel keyword (e.g. "watch")
+  /// null = keyword search bandh
+  String? itemKeyword;
+
   bool _isSharing = false;
   // DEFAULT = ALL
   String selectedStockStatus = "All";
@@ -507,6 +512,7 @@ class _StockGalleryScreenState extends State<StockGalleryScreen> {
 
   bool get _hasActiveFilter =>
       selectedItem != "All Items" ||
+          itemKeyword != null ||
           selectedStockStatus != "All" ||
           selectedImageStatus != "All" ||
           searchController.text.trim().isNotEmpty ||
@@ -538,6 +544,7 @@ class _StockGalleryScreenState extends State<StockGalleryScreen> {
   List<Map<String, dynamic>> get filteredStockItems {
     final String key = [
       selectedItem,
+      itemKeyword ?? "",
       selectedStockStatus,
       selectedImageStatus,
       searchController.text.trim().toLowerCase(),
@@ -562,11 +569,18 @@ class _StockGalleryScreenState extends State<StockGalleryScreen> {
   List<Map<String, dynamic>> _computeFilteredStockItems() {
     final String search = searchController.text.trim().toLowerCase();
 
+    /// 🔍 Item dropdown keyword (lowercase)
+    final String? keyword = itemKeyword?.trim().toLowerCase();
+
     List<Map<String, dynamic>> result = stockItems.where((item) {
       /// ITEM FILTER
-      final bool itemMatch =
-          selectedItem == "All Items" ||
-              item["item_name"]?.toString() == selectedItem;
+      /// keyword hoy → naam ma keyword hoy evi badhi items (e.g. "watch")
+      /// nahi to → select karel ek item (athva All Items)
+      final String itemName = item["item_name"]?.toString() ?? "";
+
+      final bool itemMatch = (keyword != null && keyword.isNotEmpty)
+          ? itemName.toLowerCase().contains(keyword)
+          : (selectedItem == "All Items" || itemName == selectedItem);
 
       if (!itemMatch) {
         return false;
@@ -2472,20 +2486,33 @@ class _StockGalleryScreenState extends State<StockGalleryScreen> {
                   .toList()
                   : allItems;
 
+              /// 🔍 Keyword search chalu hoy to field ma "Search: watch" dekhay
+              final Map<String, dynamic>? keywordEntry = itemKeyword == null
+                  ? null
+                  : {
+                "id": "__search__",
+                "item_name": "Search: $itemKeyword",
+              };
+
               final List<Map<String, dynamic>> dropdownItems = [
                 {"id": "all", "item_name": "All Items"},
+                if (keywordEntry != null) keywordEntry,
                 ...itemList,
               ];
 
               Map<String, dynamic>? selectedItemData;
 
-              try {
-                selectedItemData = dropdownItems.firstWhere(
-                      (item) =>
-                  item["item_name"]?.toString() == selectedItem,
-                );
-              } catch (_) {
-                selectedItemData = dropdownItems.first;
+              if (keywordEntry != null) {
+                selectedItemData = keywordEntry;
+              } else {
+                try {
+                  selectedItemData = dropdownItems.firstWhere(
+                        (item) =>
+                    item["item_name"]?.toString() == selectedItem,
+                  );
+                } catch (_) {
+                  selectedItemData = dropdownItems.first;
+                }
               }
 
               return PremiumSearchableDropdown<Map<String, dynamic>>(
@@ -2503,8 +2530,27 @@ class _StockGalleryScreenState extends State<StockGalleryScreen> {
                     item["item_code"]?.toString() ?? "",
                   ].join(" ");
                 },
-                onChanged: (selectedData) {
+
+                /// 🔥 KEYBOARD SEARCH BUTTON
+                /// "watch" lakhi ne search dabavo → naam ma "watch"
+                /// hoy evi badhi stock items grid ma
+                onSearchSubmitted: (query) {
                   setState(() {
+                    itemKeyword = query.trim();
+                    selectedItem = "All Items";
+                    selectedIds.clear();
+                  });
+
+                  // 🔥 baki na badha pages load → badhi matching items
+                  _ensureAllPagesForFilter();
+                },
+
+                onChanged: (selectedData) {
+                  // "Search: ..." entry fari select kare to kai nahi
+                  if (selectedData?["id"] == "__search__") return;
+
+                  setState(() {
+                    itemKeyword = null; // 🔥 keyword search bandh
                     selectedItem =
                         selectedData?["item_name"]?.toString() ??
                             "All Items";
@@ -2614,6 +2660,7 @@ class _StockGalleryScreenState extends State<StockGalleryScreen> {
                   onTap: () {
                     setState(() {
                       selectedItem = "All Items";
+                      itemKeyword = null; // 🔥 keyword search pan clear
                       selectedStockStatus = "All";
                       selectedImageStatus = "All";
                       searchController.clear();
